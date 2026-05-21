@@ -63,6 +63,65 @@ def load_price_panel(csv_path: str) -> pd.DataFrame:
     return pd.read_csv(path, parse_dates=["Date"]).set_index("Date").sort_index()
 
 
+def load_membership_mask(
+    membership_csv: str | None,
+    dates: pd.DatetimeIndex,
+    tickers: list[str],
+) -> np.ndarray | None:
+    """Return a dates x tickers membership mask from long snapshot data."""
+    if not membership_csv:
+        return None
+
+    path = Path(membership_csv).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Membership file not found: {path}")
+
+    membership = pd.read_csv(path, parse_dates=["date"])
+    if not {"date", "Symbol"}.issubset(membership.columns):
+        raise ValueError("Membership CSV must contain columns: date, Symbol")
+
+    membership["Symbol"] = membership["Symbol"].astype(str).str.replace(".", "-", regex=False)
+    ticker_to_idx = {ticker: i for i, ticker in enumerate(tickers)}
+    snapshots: list[tuple[pd.Timestamp, np.ndarray]] = []
+    for snapshot_date, group in membership.groupby("date", sort=True):
+        row = np.zeros(len(tickers), dtype=bool)
+        indices = [ticker_to_idx[symbol] for symbol in group["Symbol"] if symbol in ticker_to_idx]
+        if indices:
+            row[indices] = True
+        snapshots.append((pd.Timestamp(snapshot_date), row))
+
+    if not snapshots:
+        raise ValueError("Membership CSV contains no usable membership rows")
+
+    snapshot_dates = pd.DatetimeIndex([item[0] for item in snapshots])
+    snapshot_values = [item[1] for item in snapshots]
+    positions = snapshot_dates.searchsorted(dates, side="right") - 1
+    mask = np.zeros((len(dates), len(tickers)), dtype=bool)
+    for date_idx, pos in enumerate(positions):
+        if pos >= 0:
+            mask[date_idx] = snapshot_values[int(pos)]
+    return mask
+
+
+def compute_signal_medians(
+    raw_returns: np.ndarray,
+    membership_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Compute median next-day return over stocks eligible on signal day t."""
+    medians = np.full(raw_returns.shape[0], np.nan, dtype=np.float32)
+    if membership_mask is None:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+            medians[:-1] = np.nanmedian(raw_returns[1:], axis=1)
+        return medians
+
+    for end_idx in range(raw_returns.shape[0] - 1):
+        eligible = membership_mask[end_idx] & np.isfinite(raw_returns[end_idx + 1])
+        if np.any(eligible):
+            medians[end_idx] = float(np.nanmedian(raw_returns[end_idx + 1, eligible]))
+    return medians
+
+
 def chronological_train_val_indices(
     n_samples: int,
     validation_fraction: float,
@@ -402,6 +461,7 @@ def build_samples(
     seq_len: int,
     max_samples: int | None,
     rng: np.random.Generator,
+    membership_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     if last_end < first_end:
         raise ValueError("No sequence endpoints available for this split")
@@ -419,8 +479,10 @@ def build_samples(
         )
         target_indices = end_indices + 1
         next_returns = raw_returns[target_indices, stock_idx]
-        target_medians = medians[target_indices]
+        target_medians = medians[end_indices]
         valid = np.isfinite(windows).all(axis=1) & np.isfinite(next_returns) & np.isfinite(target_medians)
+        if membership_mask is not None:
+            valid &= membership_mask[end_indices, stock_idx]
         if not np.any(valid):
             continue
 
@@ -714,9 +776,8 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     tickers = returns.columns.tolist()
     raw = returns.to_numpy(dtype=np.float32)
     dates = returns.index
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
-        medians = np.nanmedian(raw, axis=1)
+    membership_mask = load_membership_mask(args.membership_csv, dates, tickers)
+    medians = compute_signal_medians(raw, membership_mask)
 
     starts = choose_period_starts(
         len(returns),
@@ -775,6 +836,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             seq_len=args.seq_len,
             max_samples=args.max_train_samples,
             rng=rng,
+            membership_mask=membership_mask,
         )
         x_trade, _, trade_meta = build_samples(
             raw,
@@ -787,6 +849,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             seq_len=args.seq_len,
             max_samples=None,
             rng=rng,
+            membership_mask=membership_mask,
         )
         print(f"  samples: train={len(x_train):,}, trade={len(x_trade):,}, stocks={len(tickers):,}")
 
@@ -947,6 +1010,11 @@ def run_subperiods(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to sp500_prices.csv")
+    parser.add_argument(
+        "--membership-csv",
+        default=None,
+        help="Optional long-form membership snapshot CSV with date,Symbol columns",
+    )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for tables and figures")
     parser.add_argument("--start", default=None, help="Optional start date, e.g. 2010-01-01")
     parser.add_argument("--end", default=None, help="Optional end date, e.g. 2024-12-30")

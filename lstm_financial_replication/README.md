@@ -14,7 +14,9 @@ predictions". Generated price files live in `data/` and are not committed.
 - Benchmark: a transparent 5-day short-term reversal strategy inspired by the paper's black-box analysis.
 - Validation: the LSTM, DNN, and logistic models hold out the most recent dates inside each training window for validation.
 
-The implementation uses only `numpy`, `pandas`, and `matplotlib`, because the local environment does not currently include TensorFlow or PyTorch. The LSTM is a compact NumPy implementation with RMSprop and early stopping.
+The main script uses only `numpy`, `pandas`, and `matplotlib`. A second runner,
+`src/replicate_lstm_keras.py`, uses TensorFlow/Keras so you can test whether the
+weak loss curves are caused by the compact NumPy optimizer rather than the data.
 
 ## Setup Data
 
@@ -49,6 +51,59 @@ For a fast smoke/development run:
 python3 src/replicate_lstm.py --quick
 ```
 
+## Keras/TensorFlow LSTM Run
+
+Use this when you want to check whether the NumPy LSTM implementation is the
+reason the loss stays close to `ln(2) = 0.6931`. The Keras runner uses the same
+rolling windows, labels, PIT membership mask, reversal benchmark, transaction
+costs, plots, and output format as `src/replicate_lstm.py`; only the LSTM
+training engine changes.
+
+Create a separate environment first:
+
+```bash
+conda create -n lstm-keras python=3.11 -y
+conda activate lstm-keras
+pip install -r requirements.txt
+pip install -r requirements-tensorflow.txt
+```
+
+Then run a quick smoke test:
+
+```bash
+python3 src/replicate_lstm_keras.py \
+  --csv data_pit/sp500_prices.csv \
+  --membership-csv data_pit/sp500_membership_snapshots.csv \
+  --subperiods early:2000-01-01:2009-12-31 \
+  --periods 1 \
+  --seq-len 240 \
+  --hidden 25 \
+  --epochs 5 \
+  --max-train-samples 50000 \
+  --output-dir outputs_lstm_keras_smoke
+```
+
+For the fuller 2000-2019 PIT-masked run:
+
+```bash
+python3 src/replicate_lstm_keras.py \
+  --csv data_pit/sp500_prices.csv \
+  --membership-csv data_pit/sp500_membership_snapshots.csv \
+  --subperiods early:2000-01-01:2009-12-31,post2010:2010-01-01:2019-12-31 \
+  --seq-len 240 \
+  --hidden 25 \
+  --epochs 30 \
+  --patience 5 \
+  --batch-size 512 \
+  --learning-rate 0.001 \
+  --max-train-samples 250000 \
+  --output-dir outputs_lstm_keras_pit_masked
+```
+
+If the Keras loss also stays near 0.693 while RAF/reversal performs better, that
+is evidence that the available return-only LSTM signal is weak in this
+2000-2019 PIT-masked sample, rather than merely a bug in the NumPy LSTM code.
+
 ## Subperiod Runs
 
 To run the LSTM once across the three report subperiods:
@@ -56,6 +111,7 @@ To run the LSTM once across the three report subperiods:
 ```bash
 python3 src/replicate_lstm.py \
   --csv data/sp500_prices.csv \
+  --membership-csv data/sp500_membership_snapshots.csv \
   --subperiods decades \
   --seq-len 240 \
   --hidden 25 \
@@ -146,10 +202,18 @@ python3 src/download_sp500_prices.py \
   --output-dir data
 ```
 
-This reduces current-constituent survivorship bias, but it is still not a fully
-point-in-time tradable universe because it does not enforce daily membership
-eligibility in the training/trading sample builders. Treat it as a PIT-union
-improvement, not a complete PIT replication.
+This reduces current-constituent survivorship bias. To enforce daily membership
+eligibility during modelling, pass the generated snapshot file via
+`--membership-csv`. With that option, training samples, trading rankings, and
+target medians are restricted to stocks that were members on the signal date.
+Residual limitations remain because Yahoo may not provide complete delisting
+returns.
+
+Check the `last_pit_row` in `historical_constituents_metadata.json`. If the
+source stops before the end of the sample, the membership mask is only reliable
+up to that date. In the cached fja05680 file used during development, the last
+snapshot is 2019-01-11, so the mask should be used for 2000-2019 analyses but
+not treated as fully point-in-time for 2020-2024.
 
 ## Benchmark Comparisons
 
@@ -205,6 +269,7 @@ To run those same benchmarks once across the three subperiods:
 ```bash
 python3 src/compare_benchmark_models.py \
   --csv data/sp500_prices.csv \
+  --membership-csv data/sp500_membership_snapshots.csv \
   --subperiods decades \
   --periods all \
   --max-train-samples 0 \

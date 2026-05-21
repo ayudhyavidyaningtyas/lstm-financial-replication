@@ -30,8 +30,10 @@ from replicate_lstm import (
     DEFAULT_CSV,
     add_reversal_score,
     chronological_train_val_indices,
+    compute_signal_medians,
     choose_period_starts,
     evaluate_ranked_portfolios,
+    load_membership_mask,
     load_price_panel,
     max_drawdown,
     parse_k_values,
@@ -134,6 +136,7 @@ def build_tabular_samples(
     horizons: list[int],
     max_samples: int | None,
     rng: np.random.Generator,
+    membership_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     if last_end < first_end:
         raise ValueError("No tabular endpoints available")
@@ -153,8 +156,10 @@ def build_tabular_samples(
 
         target_indices = end_indices + 1
         next_returns = raw_returns[target_indices, stock_idx]
-        target_medians = medians[target_indices]
+        target_medians = medians[end_indices]
         valid = np.isfinite(features).all(axis=1) & np.isfinite(next_returns) & np.isfinite(target_medians)
+        if membership_mask is not None:
+            valid &= membership_mask[end_indices, stock_idx]
         if not np.any(valid):
             continue
 
@@ -770,9 +775,8 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     raw = returns_df.to_numpy(dtype=np.float32)
     dates = returns_df.index
     tickers = returns_df.columns.tolist()
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
-        medians = np.nanmedian(raw, axis=1)
+    membership_mask = load_membership_mask(args.membership_csv, dates, tickers)
+    medians = compute_signal_medians(raw, membership_mask)
 
     starts = choose_period_starts(
         len(returns_df),
@@ -811,6 +815,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             horizons=horizons,
             max_samples=args.max_train_samples,
             rng=rng,
+            membership_mask=membership_mask,
         )
         x_trade_raw, _, trade_meta = build_tabular_samples(
             prices,
@@ -823,6 +828,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             horizons=horizons,
             max_samples=None,
             rng=rng,
+            membership_mask=membership_mask,
         )
         x_train, x_trade, _, _ = standardize(x_train_raw, x_trade_raw)
         print(f"  samples: train={len(x_train):,}, trade={len(x_trade):,}, features={x_train.shape[1]}")
@@ -1018,6 +1024,11 @@ def parse_hidden_layers(value: str) -> list[int]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", default=DEFAULT_CSV)
+    parser.add_argument(
+        "--membership-csv",
+        default=None,
+        help="Optional long-form membership snapshot CSV with date,Symbol columns",
+    )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)

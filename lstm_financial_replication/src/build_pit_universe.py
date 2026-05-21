@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Build a historical S&P 500 union ticker list.
 
-This reads the public fja05680/sp500 historical components file and writes a
-single-column constituents CSV that can be passed to download_sp500_prices.py.
+This reads the public fja05680/sp500 historical components file and writes:
+
+1. A single-column historical-union constituents CSV that can be passed to
+   download_sp500_prices.py.
+2. A long-form membership snapshot CSV (date, Symbol) that model scripts can
+   use as a point-in-time membership mask.
 
 Important limitation:
     The output is a historical union, not a daily membership mask. It reduces
@@ -52,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="data/historical_constituents.csv")
     parser.add_argument("--cache", default="data/sp500_pit_raw.csv")
     parser.add_argument("--metadata", default="data/historical_constituents_metadata.json")
+    parser.add_argument("--snapshots", default="data/sp500_membership_snapshots.csv")
     return parser
 
 
@@ -83,14 +88,21 @@ def main() -> None:
 
     universe: set[str] = set()
     row_counts = []
+    snapshot_rows = []
     for row in window.itertuples(index=False):
-        tickers = parse_ticker_string(row.tickers)
+        tickers = sorted(set(parse_ticker_string(row.tickers)))
         universe.update(tickers)
-        row_counts.append({"date": row.date.date().isoformat(), "n_tickers": len(set(tickers))})
+        row_date = row.date.date().isoformat()
+        row_counts.append({"date": row_date, "n_tickers": len(tickers)})
+        snapshot_rows.extend({"date": row_date, "Symbol": symbol} for symbol in tickers)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"Symbol": sorted(universe)}).to_csv(output_path, index=False)
+
+    snapshots_path = Path(args.snapshots)
+    snapshots_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(snapshot_rows).to_csv(snapshots_path, index=False)
 
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -103,11 +115,12 @@ def main() -> None:
         "last_pit_row": window["date"].max().date().isoformat(),
         "unique_union_tickers": int(len(universe)),
         "output": str(output_path),
+        "snapshots": str(snapshots_path),
         "row_counts": row_counts,
         "limitations": [
             "This file is a historical union of members, not a daily point-in-time membership mask.",
             "Removed/delisted tickers are included when present in the source, but Yahoo may not provide complete delisting returns.",
-            "Downstream modelling still needs a daily membership mask for a fully point-in-time tradable universe.",
+            "The snapshot file can be used as a daily membership mask by model scripts via --membership-csv.",
         ],
     }
     metadata_path = Path(args.metadata)
@@ -120,6 +133,7 @@ def main() -> None:
     )
     print(f"Unique historical-union tickers: {len(universe):,}")
     print(f"Wrote {output_path}")
+    print(f"Wrote {snapshots_path}")
     print(f"Wrote {metadata_path}")
     print("\nNext:")
     print("  python3 src/download_sp500_prices.py \\")
