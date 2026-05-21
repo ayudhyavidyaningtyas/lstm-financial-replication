@@ -122,6 +122,42 @@ def compute_signal_medians(
     return medians
 
 
+def standardize_return_panel(
+    raw_returns: np.ndarray,
+    train_start: int,
+    train_days: int,
+    mode: str,
+) -> np.ndarray:
+    """Standardize returns using information from the current training window."""
+    train_slice = raw_returns[train_start : train_start + train_days]
+    if mode == "global":
+        mu = float(np.nanmean(train_slice))
+        sigma = float(np.nanstd(train_slice))
+        if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0.0:
+            raise ValueError("invalid global training-window standard deviation")
+        return ((raw_returns - mu) / sigma).astype(np.float32)
+
+    if mode == "stock":
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
+            warnings.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice", category=RuntimeWarning)
+            mu = np.nanmean(train_slice, axis=0, keepdims=True)
+            sigma = np.nanstd(train_slice, axis=0, keepdims=True)
+        sigma = np.where(np.isfinite(sigma) & (sigma > 0.0), sigma, np.nan)
+        return ((raw_returns - mu) / sigma).astype(np.float32)
+
+    raise ValueError("--standardization must be 'stock' or 'global'")
+
+
+def describe_labels(name: str, y: np.ndarray) -> str:
+    if len(y) == 0:
+        return f"{name}: n=0"
+    p = float(np.mean(y))
+    p_clip = min(max(p, 1e-12), 1.0 - 1e-12)
+    baseline_loss = -(p_clip * math.log(p_clip) + (1.0 - p_clip) * math.log(1.0 - p_clip))
+    return f"{name}: n={len(y):,}, positive={p:.4f}, constant_loss={baseline_loss:.4f}"
+
+
 def chronological_train_val_indices(
     n_samples: int,
     validation_fraction: float,
@@ -738,7 +774,7 @@ Fischer and Krauss study whether long short-term memory networks can predict the
 
 ## Replication Design
 
-The supplied `sp500_prices.csv` contains adjusted prices for {data_range_text}. I use simple daily returns, compute the cross-sectional median return each day, standardize returns using training-window mean and standard deviation only, and train one LSTM per rolling period. The implementation keeps the paper's train/trade split and ranking portfolio construction. For runtime, this run used sequence length `{args.seq_len}`, hidden units `{args.hidden}`, max training samples per period `{args.max_train_samples}`, and periods `{periods_text}`. The script can be rerun with `--seq-len 240 --hidden 25 --periods all` for a closer but slower paper-style specification.
+The supplied `sp500_prices.csv` contains adjusted prices for {data_range_text}. I use simple daily returns, compute the cross-sectional median return each day, standardize returns using `{args.standardization}` training-window normalization, and train one LSTM per rolling period. The implementation keeps the paper's train/trade split and ranking portfolio construction. For runtime, this run used sequence length `{args.seq_len}`, hidden units `{args.hidden}`, max training samples per period `{args.max_train_samples}`, and periods `{periods_text}`. The script can be rerun with `--seq-len 240 --hidden 25 --periods all` for a closer but slower paper-style specification.
 
 ## Empirical Results
 
@@ -812,13 +848,11 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         trade_end = dates[start + args.train_days + args.trade_days - 1].date().isoformat()
         print(f"\nPeriod {period_no}/{len(starts)}: train {train_start}..{train_end}, trade {trade_start}..{trade_end}")
 
-        train_slice = raw[start : start + args.train_days]
-        mu = float(np.nanmean(train_slice))
-        sigma = float(np.nanstd(train_slice))
-        if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0.0:
-            print("  skipped: invalid training-window standard deviation")
+        try:
+            std_raw = standardize_return_panel(raw, start, args.train_days, args.standardization)
+        except ValueError as exc:
+            print(f"  skipped: {exc}")
             continue
-        std_raw = ((raw - mu) / sigma).astype(np.float32)
 
         first_train_end = start + args.seq_len - 1
         last_train_end = start + args.train_days - 2
@@ -852,6 +886,20 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             membership_mask=membership_mask,
         )
         print(f"  samples: train={len(x_train):,}, trade={len(x_trade):,}, stocks={len(tickers):,}")
+        if args.diagnostics:
+            train_idx, val_idx = chronological_train_val_indices(
+                len(y_train),
+                settings.validation_fraction,
+                train_meta["target_idx"].to_numpy(),
+            )
+            print(
+                "  diagnostics: "
+                + describe_labels("all", y_train)
+                + "; "
+                + describe_labels("train", y_train[train_idx])
+                + "; "
+                + describe_labels("val", y_train[val_idx])
+            )
 
         model = NumpyLSTMClassifier(settings, seed=args.seed + period_no)
         history = model.fit(
@@ -1029,6 +1077,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=0.002)
     parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--standardization",
+        choices=["stock", "global"],
+        default="stock",
+        help="Return standardization inside each rolling period; stock is closest to the paper-style setup",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Print label balance and constant-prediction baseline loss for each period",
+    )
     parser.add_argument(
         "--max-train-samples",
         type=int,

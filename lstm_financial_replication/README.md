@@ -39,7 +39,9 @@ The default LSTM settings are paper-style: 240-day sequences, 25 hidden units,
 750-day training windows, 250-day trading windows, and all available rolling
 periods. Early stopping now uses chronological validation dates, with 30 maximum
 epochs and patience 5. The default sample cap is disabled, so each rolling
-period uses all available training samples.
+period uses all available training samples. Returns are standardized per stock
+inside each rolling training window by default; use `--standardization global`
+to reproduce the older panel-wide normalization.
 
 ```bash
 python3 src/replicate_lstm.py
@@ -80,8 +82,34 @@ python3 src/replicate_lstm_keras.py \
   --hidden 25 \
   --epochs 5 \
   --max-train-samples 50000 \
+  --diagnostics \
   --output-dir outputs_lstm_keras_smoke
 ```
+
+If the Keras loss remains exactly flat near 0.693, run the overfit check before
+spending hours on the full backtest:
+
+```bash
+python3 src/replicate_lstm_keras.py \
+  --csv data_pit/sp500_prices.csv \
+  --membership-csv data_pit/sp500_membership_snapshots.csv \
+  --subperiods early:2000-01-01:2009-12-31 \
+  --periods 1 \
+  --seq-len 240 \
+  --hidden 25 \
+  --epochs 30 \
+  --optimizer adam \
+  --learning-rate 0.003 \
+  --batch-size 256 \
+  --max-train-samples 50000 \
+  --overfit-check-samples 2000 \
+  --diagnostics
+```
+
+The overfit check deliberately trains and validates on the same subset. If loss
+cannot fall below 0.693 there, the model setup still has a bug. If it falls
+clearly while the normal chronological validation loss stays near 0.693, the
+LSTM can learn mechanically but the out-of-time signal is weak in this sample.
 
 For the fuller 2000-2019 PIT-masked run:
 
@@ -97,6 +125,7 @@ python3 src/replicate_lstm_keras.py \
   --batch-size 512 \
   --learning-rate 0.001 \
   --max-train-samples 250000 \
+  --diagnostics \
   --output-dir outputs_lstm_keras_pit_masked
 ```
 

@@ -27,6 +27,7 @@ from replicate_lstm import (
     choose_period_starts,
     chronological_train_val_indices,
     compute_signal_medians,
+    describe_labels,
     evaluate_ranked_portfolios,
     load_membership_mask,
     load_price_panel,
@@ -35,6 +36,7 @@ from replicate_lstm import (
     parse_subperiods,
     plot_outputs,
     selected_sequence_profile,
+    standardize_return_panel,
     write_report_draft,
 )
 
@@ -66,6 +68,20 @@ def set_tensorflow_reproducibility(tf, seed: int) -> None:
         tf.config.experimental.enable_op_determinism()
     except Exception:
         pass
+
+
+def print_epoch_callback(tf):
+    class PrintEpoch(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            logs = logs or {}
+            print(
+                f"    epoch {epoch + 1:02d}: "
+                f"train_loss={logs.get('loss', float('nan')):.4f} "
+                f"val_loss={logs.get('val_loss', float('nan')):.4f} "
+                f"val_acc={logs.get('val_accuracy', float('nan')):.4f}"
+            )
+
+    return PrintEpoch()
 
 
 def build_keras_lstm(args: argparse.Namespace, tf):
@@ -110,6 +126,39 @@ def build_keras_lstm(args: argparse.Namespace, tf):
     return model
 
 
+def run_overfit_check(
+    x: np.ndarray,
+    y: np.ndarray,
+    args: argparse.Namespace,
+    tf,
+    rng: np.random.Generator,
+) -> None:
+    n = min(args.overfit_check_samples, len(x))
+    if n <= 0:
+        return
+    idx = rng.choice(len(x), size=n, replace=False)
+    x_small = x[idx]
+    y_small = y[idx]
+    print(
+        "  overfit check: training and validating on the same "
+        f"{n:,} samples ({describe_labels('subset', y_small)})"
+    )
+    model_args = copy.deepcopy(args)
+    model_args.dropout = 0.0
+    model_args.recurrent_dropout = 0.0
+    model = build_keras_lstm(model_args, tf)
+    model.fit(
+        x_small,
+        y_small,
+        validation_data=(x_small, y_small),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        shuffle=True,
+        verbose=0,
+        callbacks=[print_epoch_callback(tf)],
+    )
+
+
 def fit_keras_model(
     model,
     x: np.ndarray,
@@ -146,17 +195,7 @@ def fit_keras_model(
             )
         )
 
-    class PrintEpoch(tf.keras.callbacks.Callback):
-        def on_epoch_end(self, epoch, logs=None):
-            logs = logs or {}
-            print(
-                f"    epoch {epoch + 1:02d}: "
-                f"train_loss={logs.get('loss', float('nan')):.4f} "
-                f"val_loss={logs.get('val_loss', float('nan')):.4f} "
-                f"val_acc={logs.get('val_accuracy', float('nan')):.4f}"
-            )
-
-    callbacks.append(PrintEpoch())
+    callbacks.append(print_epoch_callback(tf))
 
     history = model.fit(
         x_train,
@@ -226,13 +265,11 @@ def run(args: argparse.Namespace, tf) -> tuple[pd.DataFrame, pd.DataFrame]:
         trade_end = dates[start + args.train_days + args.trade_days - 1].date().isoformat()
         print(f"\nPeriod {period_no}/{len(starts)}: train {train_start}..{train_end}, trade {trade_start}..{trade_end}")
 
-        train_slice = raw[start : start + args.train_days]
-        mu = float(np.nanmean(train_slice))
-        sigma = float(np.nanstd(train_slice))
-        if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0.0:
-            print("  skipped: invalid training-window standard deviation")
+        try:
+            std_raw = standardize_return_panel(raw, start, args.train_days, args.standardization)
+        except ValueError as exc:
+            print(f"  skipped: {exc}")
             continue
-        std_raw = ((raw - mu) / sigma).astype(np.float32)
 
         first_train_end = start + args.seq_len - 1
         last_train_end = start + args.train_days - 2
@@ -266,6 +303,26 @@ def run(args: argparse.Namespace, tf) -> tuple[pd.DataFrame, pd.DataFrame]:
             membership_mask=membership_mask,
         )
         print(f"  samples: train={len(x_train):,}, trade={len(x_trade):,}, stocks={len(tickers):,}")
+        if args.diagnostics:
+            train_idx, val_idx = chronological_train_val_indices(
+                len(y_train),
+                args.validation_fraction,
+                train_meta["target_idx"].to_numpy(),
+            )
+            print(
+                "  diagnostics: "
+                + describe_labels("all", y_train)
+                + "; "
+                + describe_labels("train", y_train[train_idx])
+                + "; "
+                + describe_labels("val", y_train[val_idx])
+            )
+
+        if args.overfit_check_samples > 0:
+            tf.keras.backend.clear_session()
+            set_tensorflow_reproducibility(tf, args.seed + period_no)
+            run_overfit_check(x_train, y_train, args, tf, rng)
+            raise SystemExit("Overfit check finished; no portfolio outputs were written.")
 
         tf.keras.backend.clear_session()
         set_tensorflow_reproducibility(tf, args.seed + period_no)
@@ -455,6 +512,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--recurrent-dropout", type=float, default=0.0)
     parser.add_argument("--l2", type=float, default=0.0)
+    parser.add_argument(
+        "--standardization",
+        choices=["stock", "global"],
+        default="stock",
+        help="Return standardization inside each rolling period; stock is closest to the paper-style setup",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Print label balance and constant-prediction baseline loss for each period",
+    )
+    parser.add_argument(
+        "--overfit-check-samples",
+        type=int,
+        default=0,
+        help="Train and validate on the same N samples, then exit; useful for debugging whether the LSTM can memorize",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--reduce-lr-patience", type=int, default=3)
     parser.add_argument(
