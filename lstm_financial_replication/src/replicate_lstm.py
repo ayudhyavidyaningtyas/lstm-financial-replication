@@ -4,8 +4,8 @@
 The original paper trains a separate LSTM on rolling 750-day training windows,
 then trades the next 250 days by going long the stocks with the highest
 probability of beating the cross-sectional median and short the lowest-ranked
-stocks. This script keeps that design, but exposes smaller defaults so the
-coursework replication can be run on a laptop without TensorFlow/PyTorch.
+stocks. The command-line defaults are paper-style; pass ``--quick`` for a small
+development run.
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_CSV = "/Users/ayudhya/Desktop/Personal Coursework/sp500_prices.csv"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CSV = str(PROJECT_ROOT / "data" / "sp500_prices.csv")
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs"
 SUBPERIOD_PRESETS = {
     "decades": [
@@ -51,14 +52,70 @@ def max_drawdown(returns: pd.Series) -> float:
     return float(-drawdown.min())
 
 
+def load_price_panel(csv_path: str) -> pd.DataFrame:
+    path = Path(csv_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Price file not found: {path}\n"
+            "Run `python3 src/download_sp500_prices.py --output-dir data` first, "
+            "or pass `--csv /path/to/sp500_prices.csv`."
+        )
+    return pd.read_csv(path, parse_dates=["Date"]).set_index("Date").sort_index()
+
+
+def chronological_train_val_indices(
+    n_samples: int,
+    validation_fraction: float,
+    validation_order: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold out the most recent observations for validation.
+
+    `validation_order` should be a time-like integer/date array such as target
+    date index. Whole dates are assigned to validation together when possible,
+    which avoids leaking later calendar samples into model selection.
+    """
+    if n_samples <= 1:
+        idx = np.arange(n_samples)
+        return idx, idx[:0]
+
+    if validation_order is None:
+        ordered = np.arange(n_samples)
+        split = max(1, int(n_samples * (1.0 - validation_fraction)))
+        split = min(split, n_samples - 1)
+        return ordered[:split], ordered[split:]
+
+    order_values = np.asarray(validation_order)
+    if len(order_values) != n_samples:
+        raise ValueError("validation_order must have the same length as x/y")
+
+    unique_values = np.unique(order_values)
+    if len(unique_values) <= 1:
+        ordered = np.argsort(order_values, kind="stable")
+        split = max(1, int(n_samples * (1.0 - validation_fraction)))
+        split = min(split, n_samples - 1)
+        return ordered[:split], ordered[split:]
+
+    n_val_dates = max(1, int(math.ceil(len(unique_values) * validation_fraction)))
+    cutoff = unique_values[-n_val_dates]
+    train_idx = np.flatnonzero(order_values < cutoff)
+    val_idx = np.flatnonzero(order_values >= cutoff)
+
+    if len(train_idx) == 0 or len(val_idx) == 0:
+        ordered = np.argsort(order_values, kind="stable")
+        split = max(1, int(n_samples * (1.0 - validation_fraction)))
+        split = min(split, n_samples - 1)
+        return ordered[:split], ordered[split:]
+    return train_idx, val_idx
+
+
 @dataclass
 class LSTMSettings:
     seq_len: int = 60
     hidden_dim: int = 12
     learning_rate: float = 0.002
     batch_size: int = 128
-    max_epochs: int = 6
-    patience: int = 2
+    max_epochs: int = 30
+    patience: int = 5
     dropout: float = 0.05
     validation_fraction: float = 0.2
     rmsprop_rho: float = 0.9
@@ -226,12 +283,18 @@ class NumpyLSTMClassifier:
                 total_n += len(x[start:end])
         return total_loss / max(total_n, 1)
 
-    def fit(self, x: np.ndarray, y: np.ndarray) -> list[dict[str, float]]:
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        validation_order: np.ndarray | None = None,
+    ) -> list[dict[str, float]]:
         s = self.settings
-        order = self.rng.permutation(len(x))
-        split = int(len(x) * (1.0 - s.validation_fraction))
-        train_idx = order[:split]
-        val_idx = order[split:]
+        train_idx, val_idx = chronological_train_val_indices(
+            len(x),
+            s.validation_fraction,
+            validation_order,
+        )
         x_train, y_train = x[train_idx], y[train_idx]
         x_val, y_val = x[val_idx], y[val_idx]
 
@@ -389,13 +452,20 @@ def build_samples(
     y = np.concatenate(y_parts, axis=0)
     meta = pd.concat(meta_parts, ignore_index=True)
 
-    if max_samples is not None and len(x) > max_samples:
+    if max_samples is not None and max_samples > 0 and len(x) > max_samples:
         keep = rng.choice(len(x), size=max_samples, replace=False)
         x = x[keep]
         y = y[keep]
         meta = meta.iloc[keep].reset_index(drop=True)
 
-    return x, y, meta.reset_index(drop=True)
+    # Keep samples in calendar order. The model also receives target_idx
+    # explicitly for validation, but this makes the ordering contract obvious.
+    order = np.argsort(meta["target_idx"].to_numpy(), kind="stable")
+    x = x[order]
+    y = y[order]
+    meta = meta.iloc[order].reset_index(drop=True)
+
+    return x, y, meta
 
 
 def add_reversal_score(meta: pd.DataFrame, raw_returns: np.ndarray, horizon: int = 5) -> pd.Series:
@@ -618,7 +688,7 @@ The LSTM result should be compared directionally rather than numerically with th
 
 ## Critical Comparison
 
-The original paper finds strong profitability before 2010 and much weaker profitability afterwards. A replication on recent windows is therefore expected to be less spectacular than the 1992-2015 headline number. Similarities would support the paper's interpretation that return-sequence information contains a short-horizon reversal signal. Differences can arise from survivorship/constituent coverage, the available adjusted-price dataset, the shorter/default LSTM training setup, market adaptation after publication, and transaction costs. From a financial analytics perspective, the key insight is not only whether the LSTM beats the benchmark, but whether its selected portfolios show economically interpretable behavior and whether performance survives realistic trading costs.
+The original paper finds strong profitability before 2010 and much weaker profitability afterwards. A replication on recent windows is therefore expected to be less spectacular than the 1992-2015 headline number. Similarities would support the paper's interpretation that return-sequence information contains a short-horizon reversal signal. Differences can arise from survivorship/constituent coverage, the available adjusted-price dataset, implementation details, market adaptation after publication, and transaction costs. From a financial analytics perspective, the key insight is not only whether the LSTM beats the benchmark, but whether its selected portfolios show economically interpretable behavior and whether performance survives realistic trading costs.
 
 ## Suggested Figures
 
@@ -632,7 +702,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(args.seed)
-    prices = pd.read_csv(args.csv, parse_dates=["Date"]).set_index("Date").sort_index()
+    prices = load_price_panel(args.csv)
     if args.start:
         prices = prices.loc[prices.index >= pd.Timestamp(args.start)]
     if args.end:
@@ -694,7 +764,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         first_trade_end = start + args.train_days - 1
         last_trade_end = start + args.train_days + args.trade_days - 2
 
-        x_train, y_train, _ = build_samples(
+        x_train, y_train, train_meta = build_samples(
             raw,
             std_raw,
             medians,
@@ -721,7 +791,11 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         print(f"  samples: train={len(x_train):,}, trade={len(x_trade):,}, stocks={len(tickers):,}")
 
         model = NumpyLSTMClassifier(settings, seed=args.seed + period_no)
-        history = model.fit(x_train, y_train)
+        history = model.fit(
+            x_train,
+            y_train,
+            validation_order=train_meta["target_idx"].to_numpy(),
+        )
         for row in history:
             row = dict(row)
             row["period"] = period_no
@@ -878,16 +952,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", default=None, help="Optional end date, e.g. 2024-12-30")
     parser.add_argument("--train-days", type=int, default=750)
     parser.add_argument("--trade-days", type=int, default=250)
-    parser.add_argument("--periods", default="2", help="Number of rolling periods to run, or 'all'")
+    parser.add_argument("--periods", default="all", help="Number of rolling periods to run, or 'all'")
     parser.add_argument("--period-selection", choices=["recent", "early"], default="recent")
-    parser.add_argument("--seq-len", type=int, default=60, help="Paper uses 240; default is faster")
-    parser.add_argument("--hidden", type=int, default=12, help="Paper uses 25; default is faster")
-    parser.add_argument("--epochs", type=int, default=6)
-    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--seq-len", type=int, default=240, help="Paper uses 240")
+    parser.add_argument("--hidden", type=int, default=25, help="Paper uses 25")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=0.002)
     parser.add_argument("--dropout", type=float, default=0.05)
-    parser.add_argument("--max-train-samples", type=int, default=40000)
+    parser.add_argument(
+        "--max-train-samples",
+        type=int,
+        default=0,
+        help="Maximum training samples per rolling period; 0 uses all available samples",
+    )
     parser.add_argument("--k-values", nargs="+", default=["10", "50", "100"], type=str)
     parser.add_argument("--profile-k", type=int, default=10)
     parser.add_argument("--reversal-horizon", type=int, default=5)
@@ -898,12 +977,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="Use 'decades' for 2000-2009, 2010-2019, 2020-2024, or label:start:end entries",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Override core settings for a small smoke/development run",
+    )
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if args.quick:
+        args.seq_len = 60
+        args.hidden = 12
+        args.periods = "2"
+        args.epochs = 6
+        args.max_train_samples = 40000
     args.k_values = parse_k_values(args.k_values)
     run_subperiods(args)
 

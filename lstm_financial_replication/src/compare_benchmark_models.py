@@ -29,8 +29,10 @@ import pandas as pd
 from replicate_lstm import (
     DEFAULT_CSV,
     add_reversal_score,
+    chronological_train_val_indices,
     choose_period_starts,
     evaluate_ranked_portfolios,
+    load_price_panel,
     max_drawdown,
     parse_k_values,
 )
@@ -180,13 +182,19 @@ def build_tabular_samples(
     y = np.concatenate(y_parts, axis=0)
     meta = pd.concat(meta_parts, ignore_index=True)
 
-    if max_samples is not None and len(x) > max_samples:
+    if max_samples is not None and max_samples > 0 and len(x) > max_samples:
         keep = rng.choice(len(x), size=max_samples, replace=False)
         x = x[keep]
         y = y[keep]
         meta = meta.iloc[keep].reset_index(drop=True)
 
-    return x, y, meta.reset_index(drop=True)
+    # Keep samples in calendar order for out-of-time validation and auditability.
+    order = np.argsort(meta["target_idx"].to_numpy(), kind="stable")
+    x = x[order]
+    y = y[order]
+    meta = meta.iloc[order].reset_index(drop=True)
+
+    return x, y, meta
 
 
 class LogisticRegressionSGD:
@@ -220,16 +228,19 @@ class LogisticRegressionSGD:
         assert self.w is not None
         return float(loss + 0.5 * self.l2 * np.sum(self.w * self.w))
 
-    def fit(self, x: np.ndarray, y: np.ndarray) -> list[dict[str, float]]:
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        validation_order: np.ndarray | None = None,
+    ) -> list[dict[str, float]]:
         n, p = x.shape
         self.w = self.rng.normal(0.0, 0.01, size=p).astype(np.float32)
         self.b = 0.0
         cache_w = np.zeros_like(self.w)
         cache_b = 0.0
 
-        order = self.rng.permutation(n)
-        split = int(n * 0.8)
-        train_idx, val_idx = order[:split], order[split:]
+        train_idx, val_idx = chronological_train_val_indices(n, 0.2, validation_order)
         x_train, y_train = x[train_idx], y[train_idx]
         x_val, y_val = x[val_idx], y[val_idx]
 
@@ -389,10 +400,13 @@ class DenseNeuralNetwork:
                 n += len(xb)
         return total / max(n, 1)
 
-    def fit(self, x: np.ndarray, y: np.ndarray) -> list[dict[str, float]]:
-        order = self.rng.permutation(len(x))
-        split = int(len(x) * 0.8)
-        train_idx, val_idx = order[:split], order[split:]
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        validation_order: np.ndarray | None = None,
+    ) -> list[dict[str, float]]:
+        train_idx, val_idx = chronological_train_val_indices(len(x), 0.2, validation_order)
         x_train, y_train = x[train_idx], y[train_idx]
         x_val, y_val = x[val_idx], y[val_idx]
 
@@ -744,7 +758,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     horizons = parse_horizons(args.horizons)
     max_horizon = max(horizons)
 
-    prices_df = pd.read_csv(args.csv, parse_dates=["Date"]).set_index("Date").sort_index()
+    prices_df = load_price_panel(args.csv)
     if args.start:
         prices_df = prices_df.loc[prices_df.index >= pd.Timestamp(args.start)]
     if args.end:
@@ -786,7 +800,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         first_trade_end = start + args.train_days - 1
         last_trade_end = start + args.train_days + args.trade_days - 2
 
-        x_train_raw, y_train, _ = build_tabular_samples(
+        x_train_raw, y_train, train_meta = build_tabular_samples(
             prices,
             raw,
             medians,
@@ -822,7 +836,11 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                 patience=args.patience,
                 seed=args.seed + 1000 + period_no,
             )
-            history = log_model.fit(x_train, y_train)
+            history = log_model.fit(
+                x_train,
+                y_train,
+                validation_order=train_meta["target_idx"].to_numpy(),
+            )
             scores = log_model.predict_proba(x_trade)[:, 1]
             daily, _ = evaluate_ranked_portfolios(trade_meta, scores, args.k_values, "LOG", args.half_turn_cost)
             daily["period"] = period_no
@@ -842,7 +860,11 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                 patience=args.patience,
                 seed=args.seed + 2000 + period_no,
             )
-            history = dnn_model.fit(x_train, y_train)
+            history = dnn_model.fit(
+                x_train,
+                y_train,
+                validation_order=train_meta["target_idx"].to_numpy(),
+            )
             scores = dnn_model.predict_proba(x_trade)[:, 1]
             daily, _ = evaluate_ranked_portfolios(trade_meta, scores, args.k_values, "DNN", args.half_turn_cost)
             daily["period"] = period_no
@@ -1006,19 +1028,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizons", default="paper", help="'paper' or comma/range list, e.g. 1:20,40:20:240")
     parser.add_argument("--models", default="logistic,rf,dnn,reversal")
     parser.add_argument("--k-values", nargs="+", default=["10", "50", "100"], type=str)
-    parser.add_argument("--max-train-samples", type=int, default=120000)
+    parser.add_argument(
+        "--max-train-samples",
+        type=int,
+        default=0,
+        help="Maximum training samples per rolling period; 0 uses all available samples",
+    )
     parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--half-turn-cost", type=float, default=0.0005)
     parser.add_argument("--reversal-horizon", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--log-epochs", type=int, default=12)
+    parser.add_argument("--log-epochs", type=int, default=30)
     parser.add_argument("--log-lr", type=float, default=0.01)
     parser.add_argument("--log-l2", type=float, default=1e-4)
 
     parser.add_argument("--dnn-hidden", type=parse_hidden_layers, default=parse_hidden_layers("31,10,5"))
-    parser.add_argument("--dnn-epochs", type=int, default=12)
+    parser.add_argument("--dnn-epochs", type=int, default=30)
     parser.add_argument("--dnn-lr", type=float, default=0.001)
     parser.add_argument("--dnn-l2", type=float, default=1e-5)
     parser.add_argument("--dnn-dropout", type=float, default=0.2)

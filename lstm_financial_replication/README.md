@@ -2,7 +2,7 @@
 
 This folder contains a coursework-oriented replication of Fischer and Krauss
 (2018), "Deep learning with long short-term memory networks for financial market
-predictions", using the supplied `sp500_prices.csv` file.
+predictions". Generated price files live in `data/` and are not committed.
 
 ## What It Replicates
 
@@ -12,44 +12,41 @@ predictions", using the supplied `sp500_prices.csv` file.
 - Portfolio rule: rank stocks by predicted probability, go long the top `k`, short the bottom `k`.
 - Costs: 5 bps per half-turn, matching the assumption used in the paper.
 - Benchmark: a transparent 5-day short-term reversal strategy inspired by the paper's black-box analysis.
+- Validation: the LSTM, DNN, and logistic models hold out the most recent dates inside each training window for validation.
 
 The implementation uses only `numpy`, `pandas`, and `matplotlib`, because the local environment does not currently include TensorFlow or PyTorch. The LSTM is a compact NumPy implementation with RMSprop and early stopping.
 
-## Quick Run
+## Setup Data
 
 ```bash
-python3 lstm_financial_replication/src/replicate_lstm.py
+python3 src/download_sp500_prices.py \
+  --start 2000-01-01 \
+  --end 2024-12-31 \
+  --output-dir data
 ```
 
-The quick run uses smaller defaults so it finishes on a laptop:
+This creates the default input file:
 
-- sequence length: 60 days
-- hidden units: 12
-- periods: 2 most recent rolling trading windows
-- max training samples per period: 40,000
-
-## More Paper-Like Run
-
-This is closer to the paper, but slower:
-
-```bash
-python3 lstm_financial_replication/src/replicate_lstm.py \
-  --seq-len 240 \
-  --hidden 25 \
-  --periods all \
-  --epochs 20 \
-  --max-train-samples 120000
+```text
+data/sp500_prices.csv
 ```
 
-For a middle ground:
+## Headline LSTM Run
+
+The default LSTM settings are paper-style: 240-day sequences, 25 hidden units,
+750-day training windows, 250-day trading windows, and all available rolling
+periods. Early stopping now uses chronological validation dates, with 30 maximum
+epochs and patience 5. The default sample cap is disabled, so each rolling
+period uses all available training samples.
 
 ```bash
-python3 lstm_financial_replication/src/replicate_lstm.py \
-  --seq-len 240 \
-  --hidden 16 \
-  --periods 3 \
-  --epochs 8 \
-  --max-train-samples 60000
+python3 src/replicate_lstm.py
+```
+
+For a fast smoke/development run:
+
+```bash
+python3 src/replicate_lstm.py --quick
 ```
 
 ## Subperiod Runs
@@ -63,8 +60,9 @@ python3 src/replicate_lstm.py \
   --seq-len 240 \
   --hidden 25 \
   --periods all \
-  --epochs 20 \
-  --max-train-samples 120000 \
+  --epochs 30 \
+  --patience 5 \
+  --max-train-samples 0 \
   --output-dir outputs_lstm_subperiods
 ```
 
@@ -105,15 +103,6 @@ python3 src/download_sp500_prices.py \
   --output-dir data
 ```
 
-If you want the new CSV to replace the coursework CSV location:
-
-```bash
-python3 src/download_sp500_prices.py \
-  --start 2000-01-01 \
-  --end 2024-12-31 \
-  --output-dir "/Users/ayudhya/Desktop/Personal Coursework"
-```
-
 The downloader writes:
 
 - `sp500_prices.csv`: cleaned adjusted close panel.
@@ -122,15 +111,45 @@ The downloader writes:
 - `sp500_price_quality_report.csv`: missingness, first/last valid date, suspicious-return counts.
 - `sp500_download_metadata.json`: reproducibility log and failed/empty tickers.
 
-The default universe is current S&P 500 constituents. For a stronger research
-design, use a point-in-time historical constituents file:
+### Survivorship Bias Warning
+
+The default universe is current S&P 500 constituents. This is convenient, but it
+is not survivor-bias-free because firms that left the index before the download
+date are missing. Fischer and Krauss use a survivor-bias-free constituent
+universe, so this is the largest methodological limitation of the coursework
+dataset.
+
+Survivorship bias typically inflates backtested equity-strategy performance,
+often by roughly 50-200 bps annualised in US equity studies such as Brown et al.
+(1992). Any report based on the default downloader should state that the reported
+returns are likely upward-biased. The bias may be especially relevant in the
+early subperiod because excluded bankrupt/delisted firms would often have had
+poor returns.
+
+For a stronger research design, use a point-in-time historical constituents file:
+
+```bash
+python3 src/build_pit_universe.py \
+  --start 2000-01-01 \
+  --end 2024-12-31 \
+  --output data/historical_constituents.csv
+```
+
+Then download prices for that historical-union universe:
 
 ```bash
 python3 src/download_sp500_prices.py \
-  --constituents-csv historical_constituents.csv \
+  --constituents-csv data/historical_constituents.csv \
   --ticker-column Symbol \
+  --start 2000-01-01 \
+  --end 2024-12-31 \
   --output-dir data
 ```
+
+This reduces current-constituent survivorship bias, but it is still not a fully
+point-in-time tradable universe because it does not enforce daily membership
+eligibility in the training/trading sample builders. Treat it as a PIT-union
+improvement, not a complete PIT replication.
 
 ## Benchmark Comparisons
 
@@ -174,10 +193,11 @@ For a fuller run:
 ```bash
 python3 src/compare_benchmark_models.py \
   --periods all \
-  --max-train-samples 120000 \
+  --max-train-samples 0 \
   --rf-trees 100 \
-  --dnn-epochs 12 \
-  --log-epochs 12
+  --dnn-epochs 30 \
+  --log-epochs 30 \
+  --patience 5
 ```
 
 To run those same benchmarks once across the three subperiods:
@@ -187,10 +207,11 @@ python3 src/compare_benchmark_models.py \
   --csv data/sp500_prices.csv \
   --subperiods decades \
   --periods all \
-  --max-train-samples 120000 \
+  --max-train-samples 0 \
   --rf-trees 100 \
-  --dnn-epochs 12 \
-  --log-epochs 12 \
+  --dnn-epochs 30 \
+  --log-epochs 30 \
+  --patience 5 \
   --lstm-daily outputs_lstm_subperiods/daily_portfolio_returns_by_subperiod.csv \
   --output-dir outputs_benchmarks_subperiods
 ```
@@ -217,7 +238,8 @@ that implementation automatically for the random forest.
 
 The brief does not require exact numerical replication. In the report, be explicit
 that the dataset differs from the paper: it starts in 2000 rather than 1990,
-extends to 2024 rather than 2015, and may not contain historical point-in-time
-S&P 500 constituents. That means the right comparison is methodological and
-directional: whether the rolling LSTM and the long-short construction behave
-similarly, and whether the results survive transaction costs.
+extends to 2024 rather than 2015, and defaults to current rather than
+point-in-time historical S&P 500 constituents. That means the right comparison is
+methodological and directional: whether the rolling LSTM and the long-short
+construction behave similarly, whether the signal decays after 2010, and whether
+the results survive transaction costs.

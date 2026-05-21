@@ -5,7 +5,10 @@ __pycache__/
 # Coursework outputs can be regenerated.
 lstm_financial_replication/outputs/
 lstm_financial_replication/outputs_*/
-lstm_financial_replication/data/
+lstm_financial_replication/data/*
+!lstm_financial_replication/data/.gitkeep
+!lstm_financial_replication/data/README.md
+lstm_financial_replication/data_pit/
 
 # Local Python/cache files.
 .ipynb_checkpoints/
