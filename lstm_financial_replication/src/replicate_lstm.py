@@ -122,6 +122,25 @@ def compute_signal_medians(
     return medians
 
 
+def filter_extreme_returns(
+    raw_returns: np.ndarray,
+    max_abs_daily_return: float,
+) -> tuple[np.ndarray, int]:
+    """Treat implausible one-day returns as missing before modelling.
+
+    Yahoo's historical data for old/delisted symbols can contain ticker-reuse or
+    stale-price artefacts. Keeping those observations can dominate the long-short
+    portfolio arithmetic, especially in PIT-union panels.
+    """
+    if max_abs_daily_return <= 0.0:
+        return raw_returns, 0
+    cleaned = raw_returns.copy()
+    bad = np.isfinite(cleaned) & (np.abs(cleaned) > max_abs_daily_return)
+    n_bad = int(bad.sum())
+    cleaned[bad] = np.nan
+    return cleaned, n_bad
+
+
 def standardize_return_panel(
     raw_returns: np.ndarray,
     train_start: int,
@@ -813,6 +832,12 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     raw = returns.to_numpy(dtype=np.float32)
     dates = returns.index
     membership_mask = load_membership_mask(args.membership_csv, dates, tickers)
+    raw, n_filtered_returns = filter_extreme_returns(raw, args.max_abs_daily_return)
+    if n_filtered_returns:
+        print(
+            f"Filtered {n_filtered_returns:,} one-day returns with "
+            f"|return| > {args.max_abs_daily_return:.2f} before modelling."
+        )
     medians = compute_signal_medians(raw, membership_mask)
 
     starts = choose_period_starts(
@@ -1098,6 +1123,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-k", type=int, default=10)
     parser.add_argument("--reversal-horizon", type=int, default=5)
     parser.add_argument("--half-turn-cost", type=float, default=0.0005)
+    parser.add_argument(
+        "--max-abs-daily-return",
+        type=float,
+        default=0.5,
+        help="Set one-day returns with absolute value above this threshold to NaN; use 0 to disable",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--subperiods",

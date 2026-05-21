@@ -41,7 +41,9 @@ periods. Early stopping now uses chronological validation dates, with 30 maximum
 epochs and patience 5. The default sample cap is disabled, so each rolling
 period uses all available training samples. Returns are standardized per stock
 inside each rolling training window by default; use `--standardization global`
-to reproduce the older panel-wide normalization.
+to reproduce the older panel-wide normalization. One-day returns with absolute
+value above 50% are treated as missing by default, which guards against Yahoo
+artefacts in old/delisted tickers in the PIT-union panel.
 
 ```bash
 python3 src/replicate_lstm.py
@@ -110,6 +112,12 @@ The overfit check deliberately trains and validates on the same subset. If loss
 cannot fall below 0.693 there, the model setup still has a bug. If it falls
 clearly while the normal chronological validation loss stays near 0.693, the
 LSTM can learn mechanically but the out-of-time signal is weak in this sample.
+
+If a summary shows implausible daily returns, for example `0.40` meaning 40% per
+day, inspect `data_pit/sp500_price_quality_report.csv`. Old symbols can contain
+bad Yahoo price jumps; leave the default `--max-abs-daily-return 0.5` filter on
+for coursework results. Use `--max-abs-daily-return 0` only for auditing the raw
+download.
 
 For the fuller 2000-2019 PIT-masked run:
 

@@ -33,6 +33,7 @@ from replicate_lstm import (
     compute_signal_medians,
     choose_period_starts,
     evaluate_ranked_portfolios,
+    filter_extreme_returns,
     load_membership_mask,
     load_price_panel,
     max_drawdown,
@@ -776,6 +777,12 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     dates = returns_df.index
     tickers = returns_df.columns.tolist()
     membership_mask = load_membership_mask(args.membership_csv, dates, tickers)
+    raw, n_filtered_returns = filter_extreme_returns(raw, args.max_abs_daily_return)
+    if n_filtered_returns:
+        print(
+            f"Filtered {n_filtered_returns:,} one-day returns with "
+            f"|return| > {args.max_abs_daily_return:.2f} before modelling."
+        )
     medians = compute_signal_medians(raw, membership_mask)
 
     starts = choose_period_starts(
@@ -1048,6 +1055,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--half-turn-cost", type=float, default=0.0005)
+    parser.add_argument(
+        "--max-abs-daily-return",
+        type=float,
+        default=0.5,
+        help="Set one-day returns with absolute value above this threshold to NaN; use 0 to disable",
+    )
     parser.add_argument("--reversal-horizon", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
 
